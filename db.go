@@ -1009,7 +1009,6 @@ var errNoRoom = stderrors.New("No room for write")
 
 // ensureRoomForWrite is always called serially.
 func (db *DB) ensureRoomForWrite() error {
-	var err error
 	db.lock.Lock()
 	defer db.lock.Unlock()
 
@@ -1024,10 +1023,13 @@ func (db *DB) ensureRoomForWrite() error {
 			db.mt.sl.MemSize(), len(db.flushChan))
 		// We manage to push this task. Let's modify imm.
 		db.imm = append(db.imm, db.mt)
-		db.mt, err = db.newMemTable()
+		// don't overwrite our memory MT yet!
+		newmt, err := db.newMemTable()
 		if err != nil {
 			return y.Wrapf(err, "cannot create new mem table")
 		}
+		db.mt = newmt
+
 		// New memtable is empty. We certainly have room.
 		return nil
 	default:
@@ -1105,10 +1107,24 @@ func (db *DB) flushMemtable(lc *z.Closer) {
 
 		for {
 			if err := db.handleMemTableFlush(mt, nil); err != nil {
-				// Encountered error. Retry indefinitely.
-				db.opt.Errorf("error flushing memtable to disk: %v, retrying", err)
-				time.Sleep(time.Second)
-				continue
+				// cannot write our .mem (WAL) to an .sst.
+				// block writes, then stop trying to flush the memtable.
+				// this is required so that we can actually close the DB connection, otherwise we
+				// will hang here forever, trying to create new .sst files (with ever-increasing file names)
+				if strings.Contains(err.Error(), "no space left on device") {
+					// We can't keep trying to flush to a full disk -- it's causing an infinite
+					// loop of trying to write to ever-increasing '0001.sst' files.
+					// I think we have to rely on the fact that we have the WAL, and we can retry to apply it after
+					// we start up again.
+					db.opt.Errorf("error flushing memtable to disk: %v, halting", err)
+					db.blockWrite()
+					return
+				} else {
+					// Encountered error. Retry indefinitely.
+					db.opt.Errorf("error flushing memtable to disk: %v, retrying", err)
+					time.Sleep(time.Second)
+					continue
+				}
 			}
 
 			// Update s.imm. Need a lock.

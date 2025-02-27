@@ -47,11 +47,22 @@ const (
 
 	mi int64 = 1 << 20 //nolint:unused
 
+	// size of the vlog header entry containing written size of the WAL
+	vlogUsedFileSizeLen = 4
+	// size of the keyID in the vlog header
+	vlogKeyIDLen = 8
+	// size of the BaseIV within the vlog header
+	vlogBaseIVLen = 12
+	// offset into the header to access KeyID
+	vlogKeyIDOffset = vlogUsedFileSizeLen
+	// offset into the header to access BaseIV
+	vlogBaseIVOffset = vlogUsedFileSizeLen + vlogKeyIDLen
+
 	// size of vlog header.
-	// +----------------+------------------+
-	// | keyID(8 bytes) |  baseIV(12 bytes)|
-	// +----------------+------------------+
-	vlogHeaderSize = 20
+	// +------------------+----------------+------------------+-----------+
+	// | usedSize(4 bytes)| keyID(8 bytes) |  baseIV(12 bytes)|	 entry... |
+	// +------------------+----------------+------------------+-----------+
+	vlogHeaderSize = vlogUsedFileSizeLen + vlogKeyIDLen + vlogBaseIVLen
 )
 
 var errStop = stderrors.New("Stop iteration")
@@ -443,7 +454,9 @@ type valueLog struct {
 	// A refcount of iterators -- when this hits zero, we can delete the filesToBeDeleted.
 	numActiveIterators atomic.Int32
 
-	db                *DB
+	db *DB
+	// note: the underlying logFile struct does NOT track its written size
+	// we must update it as we go
 	writableLogOffset atomic.Uint32 // read by read, written by write
 	numEntriesWritten uint32
 	opt               Options
@@ -579,7 +592,7 @@ func (vlog *valueLog) open(db *DB) error {
 			return y.Wrapf(err, "Open existing file: %q", lf.path)
 		}
 		// We shouldn't delete the maxFid file.
-		if lf.size.Load() == vlogHeaderSize && fid != vlog.maxFid {
+		if lf.GetSize() == vlogHeaderSize && fid != vlog.maxFid {
 			vlog.opt.Infof("Deleting empty file: %s", lf.path)
 			if err := lf.Delete(); err != nil {
 				return y.Wrapf(err, "while trying to delete empty file: %s", lf.path)
@@ -813,7 +826,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		// Increase the file size if we cannot accommodate this entry.
 		// [Aman] Should this be >= or just >? Doesn't make sense to extend the file if it big enough already.
 		if int(endOffset) >= len(curlf.Data) {
-			if err := curlf.Truncate(int64(endOffset)); err != nil {
+			if err := curlf.Allocate(int64(endOffset)); err != nil {
 				return err
 			}
 		}
@@ -821,7 +834,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		start := int(endOffset - n)
 		y.AssertTrue(copy(curlf.Data[start:], buf.Bytes()) == int(n))
 
-		curlf.size.Store(endOffset)
+		curlf.SetSize(endOffset)
 		return nil
 	}
 

@@ -20,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/pkg/errors"
 
@@ -208,8 +207,8 @@ func (mt *memTable) UpdateSkipList() error {
 	if err != nil {
 		return y.Wrapf(err, "while iterating wal: %s", mt.wal.Fd.Name())
 	}
-	if endOff < mt.wal.size.Load() && mt.opt.ReadOnly {
-		return y.Wrapf(ErrTruncateNeeded, "end offset: %d < size: %d", endOff, mt.wal.size.Load())
+	if endOff < mt.wal.GetSize() && mt.opt.ReadOnly {
+		return y.Wrapf(ErrTruncateNeeded, "end offset: %d < size: %d", endOff, mt.wal.GetSize())
 	}
 	return mt.wal.Truncate(int64(endOff))
 }
@@ -258,7 +257,6 @@ type logFile struct {
 	// exclusive ownership to open/close the descriptor, unmap or remove the file.
 	lock     sync.RWMutex
 	fid      uint32
-	size     atomic.Uint32
 	dataKey  *pb.DataKey
 	baseIV   []byte
 	registry *KeyRegistry
@@ -273,7 +271,7 @@ func (lf *logFile) Truncate(end int64) error {
 		return nil
 	}
 	y.AssertTrue(!lf.opt.ReadOnly)
-	lf.size.Store(uint32(end))
+	lf.MmapFile.SetSize(uint32(end))
 	return lf.MmapFile.Truncate(end)
 }
 
@@ -331,6 +329,7 @@ func (lf *logFile) writeEntry(buf *bytes.Buffer, e *Entry, opt Options) error {
 	}
 	y.AssertTrue(plen == copy(lf.Data[lf.writeAt:], buf.Bytes()))
 	lf.writeAt += uint32(plen)
+	lf.MmapFile.IncrementSizeBy(uint32(plen))
 
 	lf.zeroNextEntry()
 	return nil
@@ -384,7 +383,7 @@ func (lf *logFile) read(p valuePointer) (buf []byte, err error) {
 	// causing the read to fail with ErrEOF. See issue #585.
 	size := int64(len(lf.Data))
 	valsz := p.Len
-	lfsz := lf.size.Load()
+	lfsz := lf.GetSize()
 	if int64(offset) >= size || int64(offset+valsz) > size ||
 		// Ensure that the read is within the file's actual size. It might be possible that
 		// the offset+valsz length is beyond the file's actual size. This could happen when
@@ -420,6 +419,9 @@ func (lf *logFile) doneWriting(offset uint32) error {
 	// no longer valid, while someone might be reading it. Therefore, we need a lock here again.
 	lf.lock.Lock()
 	defer lf.lock.Unlock()
+
+	// set our logfile 'size' correctly
+	lf.MmapFile.SetSize(offset)
 
 	if err := lf.Truncate(int64(offset)); err != nil {
 		return y.Wrapf(err, "Unable to truncate file: %q", lf.path)
@@ -545,14 +547,13 @@ func (lf *logFile) open(path string, flags int, fsize int64) error {
 			os.Remove(path)
 			return err
 		}
-		lf.size.Store(vlogHeaderSize)
-
+		// new log files should always have *only* the header
+		y.AssertTrue(lf.GetSize() == vlogHeaderSize)
 	} else if ferr != nil {
 		return y.Wrapf(ferr, "while opening file: %s", path)
 	}
-	lf.size.Store(uint32(len(lf.Data)))
 
-	if lf.size.Load() < vlogHeaderSize {
+	if lf.GetSize() < vlogHeaderSize {
 		// Every vlog file should have at least vlogHeaderSize. If it is less than vlogHeaderSize
 		// then it must have been corrupted. But no need to handle here. log replayer will truncate
 		// and bootstrap the logfile. So ignoring here.
@@ -563,15 +564,15 @@ func (lf *logFile) open(path string, flags int, fsize int64) error {
 	buf := make([]byte, vlogHeaderSize)
 
 	y.AssertTruef(vlogHeaderSize == copy(buf, lf.Data),
-		"Unable to copy from %s, size %d", path, lf.size.Load())
-	keyID := binary.BigEndian.Uint64(buf[:8])
+		"Unable to copy from %s, size %d", path, lf.GetSize())
+	keyID := binary.BigEndian.Uint64(buf[vlogKeyIDOffset : vlogKeyIDOffset+vlogKeyIDLen])
 	// retrieve datakey.
 	if dk, err := lf.registry.DataKey(keyID); err != nil {
 		return y.Wrapf(err, "While opening vlog file %d", lf.fid)
 	} else {
 		lf.dataKey = dk
 	}
-	lf.baseIV = buf[8:]
+	lf.baseIV = buf[vlogBaseIVOffset : vlogBaseIVOffset+vlogBaseIVLen]
 	y.AssertTrue(len(lf.baseIV) == 12)
 
 	// Preserved ferr so we can return if this was a new file.
@@ -580,9 +581,9 @@ func (lf *logFile) open(path string, flags int, fsize int64) error {
 
 // bootstrap will initialize the log file with key id and baseIV.
 // The below figure shows the layout of log file.
-// +----------------+------------------+------------------+
-// | keyID(8 bytes) |  baseIV(12 bytes)|	 entry...     |
-// +----------------+------------------+------------------+
+// +------------------+----------------+------------------+-----------+
+// | usedSize(4 bytes)| keyID(8 bytes) |  baseIV(12 bytes)|	 entry... |
+// +------------------+----------------+------------------+-----------+
 func (lf *logFile) bootstrap() error {
 	var err error
 
@@ -598,18 +599,19 @@ func (lf *logFile) bootstrap() error {
 
 	// write key id to the buf.
 	// key id will be zero if the logfile is in plain text.
-	binary.BigEndian.PutUint64(buf[:8], lf.keyID())
+	binary.BigEndian.PutUint64(buf[vlogKeyIDOffset:vlogKeyIDOffset+vlogKeyIDLen], lf.keyID())
 	// generate base IV. It'll be used with offset of the vptr to encrypt the entry.
-	if _, err := cryptorand.Read(buf[8:]); err != nil {
+	if _, err := cryptorand.Read(buf[vlogBaseIVOffset : vlogBaseIVOffset+vlogBaseIVLen]); err != nil {
 		return y.Wrapf(err, "Error while creating base IV, while creating logfile")
 	}
 
 	// Initialize base IV.
-	lf.baseIV = buf[8:]
+	lf.baseIV = buf[vlogBaseIVOffset : vlogBaseIVOffset+vlogBaseIVLen]
 	y.AssertTrue(len(lf.baseIV) == 12)
-
 	// Copy over to the logFile.
 	y.AssertTrue(vlogHeaderSize == copy(lf.Data[0:], buf))
+	// store
+	lf.MmapFile.SetSize(vlogHeaderSize)
 
 	// Zero out the next entry.
 	lf.zeroNextEntry()
