@@ -1,8 +1,8 @@
 module github.com/dgraph-io/badger/v4
 
-go 1.22.5
+go 1.22.12
 
-//toolchain go1.24.0
+toolchain go1.24.0
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -21,12 +21,12 @@ require (
 )
 
 require (
-	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/otel/metric v1.34.0 // indirect
@@ -38,5 +38,3 @@ require (
 retract v4.0.0 // see #1888 and #1889
 
 retract v4.3.0 // see #2113 and #2121
-
-replace github.com/dgraph-io/ristretto/v2 => /home/astraw/opensource/ristretto
